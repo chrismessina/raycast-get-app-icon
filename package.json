@@ -34,8 +34,14 @@
       "required": false,
       "description": "Choose whether to display applications as a list or grid by default",
       "data": [
-        { "title": "List", "value": "list" },
-        { "title": "Grid", "value": "grid" }
+        {
+          "title": "List",
+          "value": "list"
+        },
+        {
+          "title": "Grid",
+          "value": "grid"
+        }
       ]
     },
     {
@@ -160,6 +166,7 @@
     "@raycast/utils": "^1.17.0"
   },
   "devDependencies": {
+    "@ianvs/prettier-plugin-sort-imports": "^4.7.0",
     "@raycast/eslint-config": "^2.0.4",
     "@types/node": "22.13.10",
     "@types/react": "19.0.10",
