@@ -1,25 +1,25 @@
-import {
-  Action,
-  ActionPanel,
-  Application,
-  Clipboard,
-  Grid,
-  Icon,
-  List,
-  LocalStorage,
-  Toast,
-  getApplications,
-  getPreferenceValues,
-  showInFinder,
-  showToast,
-} from "@raycast/api";
-import { usePromise } from "@raycast/utils";
-import { useEffect, useState } from "react";
 import { execFile } from "node:child_process";
 import { copyFile, mkdir, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { useEffect, useState } from "react";
+import {
+  Action,
+  ActionPanel,
+  Application,
+  Clipboard,
+  getApplications,
+  getPreferenceValues,
+  Grid,
+  Icon,
+  List,
+  LocalStorage,
+  showInFinder,
+  showToast,
+  Toast,
+} from "@raycast/api";
+import { usePromise } from "@raycast/utils";
 
 // macOS-only system binaries for image processing and icon extraction.
 // These are guaranteed to exist on every macOS installation.
