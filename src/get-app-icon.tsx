@@ -3,6 +3,7 @@ import { copyFile, mkdir, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { countOf, failToast, getErrorMessage, showError } from "@chrismessina/raycast-kit";
 import { useEffect, useState } from "react";
 import {
   Action,
@@ -48,12 +49,6 @@ function sanitizeFolderName(input: string): string {
 }
 
 type ExportFormat = "png" | "jpeg" | "icns";
-
-function pluralize(count: number, singular: string, plural?: string): string {
-  if (count === 0) return `no ${plural ?? singular + "s"}`;
-  if (count === 1) return `${count} ${singular}`;
-  return `${count} ${plural ?? singular + "s"}`;
-}
 
 function getEnabledSizes(prefs: ExtensionPreferences): readonly number[] {
   const sizes = ALL_SIZES.filter((s) => prefs[`size${s}` as keyof ExtensionPreferences]);
@@ -214,7 +209,7 @@ async function exportIcons(
       const results = await exportIconsForFormat(app, sizes, outputDir, format);
       allResults.push(...results);
     } catch (error) {
-      warnings.push(`${format.toUpperCase()}: ${error instanceof Error ? error.message : String(error)}`);
+      warnings.push(`${format.toUpperCase()}: ${getErrorMessage(error)}`);
     }
   }
 
@@ -242,16 +237,14 @@ async function exportWithToast(
   try {
     const { outputDir, results, warnings } = await exportIcons(app, sizes, outputPath, formats);
     toast.style = Toast.Style.Success;
-    toast.title = `Exported ${pluralize(results.length, "icon")}`;
+    toast.title = `Exported ${countOf(results.length, "icon", { zero: "no icons" })}`;
     toast.message = warnings.length > 0 ? `${outputDir}\n⚠ ${warnings.join("; ")}` : outputDir;
     toast.primaryAction = {
       title: "Reveal in Finder",
       onAction: () => showInFinder(outputDir),
     };
   } catch (error) {
-    toast.style = Toast.Style.Failure;
-    toast.title = `Failed to export ${app.name}'s icons`;
-    toast.message = String(error);
+    failToast(toast, error, { title: `Failed to export ${app.name}'s icons` });
   }
 }
 
@@ -306,9 +299,7 @@ function AppActions({
               toast.style = Toast.Style.Success;
               toast.title = `Copied ${largestSize} x ${largestSize} icon`;
             } catch (error) {
-              toast.style = Toast.Style.Failure;
-              toast.title = `Failed to copy icon`;
-              toast.message = String(error);
+              failToast(toast, error, { title: "Failed to copy icon" });
             }
           }}
         />
@@ -329,9 +320,7 @@ function AppActions({
                   toast.style = Toast.Style.Success;
                   toast.title = `Copied ${size} x ${size} icon`;
                 } catch (error) {
-                  toast.style = Toast.Style.Failure;
-                  toast.title = `Failed to copy ${size} x ${size} icon`;
-                  toast.message = String(error);
+                  failToast(toast, error, { title: `Failed to copy ${size} x ${size} icon` });
                 }
               }}
             />
@@ -384,11 +373,7 @@ function AppActions({
                 `tell application "Finder" to open information window of (POSIX file "${escapeStringLiteral(app.path)}" as alias)`,
               ]);
             } catch (error) {
-              await showToast({
-                style: Toast.Style.Failure,
-                title: "Failed to show info in Finder",
-                message: String(error),
-              });
+              await showError(error, { title: "Failed to show info in Finder" });
             }
           }}
         />

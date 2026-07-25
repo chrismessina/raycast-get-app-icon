@@ -162,6 +162,7 @@
     }
   ],
   "dependencies": {
+    "@chrismessina/raycast-kit": "^0.1.0",
     "@raycast/api": "^1.104.4",
     "@raycast/utils": "^1.17.0"
   },
