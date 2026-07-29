@@ -1,6 +1,16 @@
 name: Sync from upstream
 
 on:
+  # Fires on its own so a merged Store PR reaches this mirror without anyone
+  # remembering to trigger it. The dispatch sender on the fork is the fast path
+  # when it works; this schedule is the backstop for when it doesn't — which was
+  # the actual history here (one manual run in five months, so the mirror silently
+  # drifted and every ship session had to reconcile it by hand).
+  #
+  # Daily is the right cadence: a Store review takes days, and the sync is a no-op
+  # when there is nothing new, so a tighter schedule buys nothing.
+  schedule:
+    - cron: "17 9 * * *" # 09:17 UTC daily — off the hour to avoid GitHub's peak-minute queue
   repository_dispatch:
     types: [upstream-sync]
   workflow_dispatch:
