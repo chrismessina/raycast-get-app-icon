@@ -665,6 +665,8 @@ export default function Command() {
 
     (async () => {
       let toast: Toast | undefined;
+      // What the grid last published, so the cleanup below can spare those files.
+      let rendered: ReadonlyMap<string, string> | undefined;
       try {
         // Show whatever is already cached before doing any work, so a warm cache
         // renders sharp immediately.
@@ -696,10 +698,7 @@ export default function Command() {
         const refreshed = await listCachedApps(appPaths);
         if (cancelled) return;
         setCachedApps(refreshed);
-        // Hand prune what is actually on screen. Without this it deletes entries that are
-        // no longer the live key but are still being rendered, blanking those tiles until
-        // the next refresh.
-        await pruneIconCache(appPaths, refreshed.values());
+        rendered = refreshed;
       } catch (error) {
         // An aborted extraction is a view change, not a failure worth a toast.
         if (!cancelled) {
@@ -711,6 +710,16 @@ export default function Command() {
         // Always retire the progress toast — leaving "Preparing icons…" on screen
         // after the work stops is the UI lying about its state.
         await toast?.hide();
+        // Prune here, not on the success path. Every early return above sits before it, so
+        // abandoning the grid used to skip collection entirely — and because an entry's
+        // name encodes source state, each abandoned visit could strand another superseded
+        // entry for any app that changed meanwhile, with nothing collecting them until a
+        // visit happened to run to completion. Measured: 33 of 327 apps changed within a
+        // day, so a churny session could strand tens of MB.
+        //
+        // Whatever the grid last published is passed as in-use, so this can never delete
+        // the file a rendered tile points at.
+        await pruneIconCache(appPaths, rendered?.values() ?? []).catch(() => {});
       }
     })();
 

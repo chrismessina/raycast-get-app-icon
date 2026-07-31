@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { environment } from "@raycast/api";
@@ -134,15 +134,21 @@ function appPrefix(appPath: string): string {
  * Verified: overwriting `AppIcon.icns` in place moved only that file's mtime, and none of
  * the four directory/plist stamps, so the change was invisible without this.
  *
- * `AppIcon.icns` and `Assets.car` are the conventional names and cover the overwhelming
- * majority; a bundle using a different `CFBundleIconFile` still gets caught by the
- * `Resources` directory stamp on any add/replace/remove. Reading the plist to resolve the
- * real name would cost a `plutil` spawn per app per grid visit, which is a bad trade for
- * a case the directory stamp already handles.
+ * The bundle's DECLARED icon file is sampled as well, not just the conventional names.
+ * `CFBundleIconFile` may name anything, and an updater rewriting that file's bytes in
+ * place moves neither the `Resources` directory mtime nor any other stamp — so the change
+ * would be invisible. This is not exotic: of 327 apps installed here, **150** declare a
+ * name other than `AppIcon.icns`, including Visual Studio Code (`Code.icns`), Chrome Beta
+ * (`app.icns`) and Airtable (`icon.icns`).
+ *
+ * The name is read from `Info.plist` directly rather than by spawning `plutil`, which
+ * would cost a process per app per grid visit. Binary plists aren't parsed — the declared
+ * name is then simply not sampled, leaving the conventional ones plus the directory stamp,
+ * which is the same coverage this had before.
  */
-function iconStampPaths(appPath: string): string[] {
+async function iconStampPaths(appPath: string): Promise<string[]> {
   const resources = path.join(appPath, "Contents", "Resources");
-  return [
+  const paths = [
     appPath,
     path.join(appPath, "Contents"),
     path.join(appPath, "Contents", "Info.plist"),
@@ -150,6 +156,30 @@ function iconStampPaths(appPath: string): string[] {
     path.join(resources, "AppIcon.icns"),
     path.join(resources, "Assets.car"),
   ];
+  const declared = await declaredIconFile(appPath);
+  if (declared && declared !== "AppIcon.icns" && declared !== "Assets.car") {
+    paths.push(path.join(resources, declared));
+  }
+  return paths;
+}
+
+/**
+ * The `CFBundleIconFile` value, normalised to a filename, or null when it can't be read.
+ *
+ * XML plists are matched textually; a binary plist yields null rather than a wrong answer,
+ * because a bogus path would hash into the key and churn it. `.icns` is appended when the
+ * declared value omits it, which is the documented shorthand.
+ */
+async function declaredIconFile(appPath: string): Promise<string | null> {
+  try {
+    const plist = await readFile(path.join(appPath, "Contents", "Info.plist"), "utf8");
+    const match = plist.match(/<key>CFBundleIconFile<\/key>\s*<string>([^<]+)<\/string>/);
+    const name = match?.[1]?.trim();
+    if (!name || name.includes("/")) return null;
+    return name.endsWith(".icns") ? name : `${name}.icns`;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -196,7 +226,7 @@ async function stampState(target: string): Promise<string> {
  * any entry to its app without opening it.
  */
 async function cacheKey(appPath: string): Promise<string> {
-  const states = await Promise.all(iconStampPaths(appPath).map(stampState));
+  const states = await Promise.all((await iconStampPaths(appPath)).map(stampState));
   // The app path is already in the prefix; including it here too binds the state digest to
   // this app, so two apps with coincidentally identical state vectors can't share a name.
   const digest = createHash("sha256")
