@@ -22,7 +22,7 @@ import {
   Toast,
 } from "@raycast/api";
 import { usePromise } from "@raycast/utils";
-import { cachedIconPath, invalidateCachedIcon, listCachedApps, pruneIconCache, refreshIconCache } from "./icon-cache";
+import { invalidateCachedIcon, listCachedApps, pruneIconCache, refreshIconCache } from "./icon-cache";
 
 // macOS-only system binaries for image processing and icon extraction.
 // These are guaranteed to exist on every macOS installation.
@@ -650,7 +650,10 @@ export default function Command() {
   // Grid tiles render far larger than the 32pt image `fileIcon` resolves to, so they
   // look soft. Extract real 256px icons to a cache and point the tiles at those. Only
   // the grid needs this — list rows are close enough to `fileIcon`'s nominal size.
-  const [cachedApps, setCachedApps] = useState<ReadonlySet<string>>(new Set());
+  // Maps an app to the cache file to render for it. The filename encodes the source state
+  // it was drawn from, so it can only come from a resolver that looked — the grid can no
+  // longer derive it, which is what keeps the tile and the freshness check in agreement.
+  const [cachedApps, setCachedApps] = useState<ReadonlyMap<string, string>>(new Map());
   useEffect(() => {
     if (viewMode !== "grid" || !apps || apps.length === 0) return;
 
@@ -729,7 +732,7 @@ export default function Command() {
             // The cached 256px PNG renders sharp. `Image.Fallback` can't hold a
             // FileIcon, so pick the source directly: apps not yet cached (or that
             // the extractor couldn't handle) keep the soft-but-present system icon.
-            content={cachedApps.has(app.path) ? { source: cachedIconPath(app.path) } : { fileIcon: app.path }}
+            content={cachedApps.get(app.path) ? { source: cachedApps.get(app.path) as string } : { fileIcon: app.path }}
             title={app.name}
             keywords={app.bundleId ? [app.bundleId] : []}
             actions={<AppActions app={app} {...actionProps} />}

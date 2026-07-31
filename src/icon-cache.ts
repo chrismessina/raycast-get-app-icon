@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { environment } from "@raycast/api";
@@ -55,8 +55,6 @@ while let line = readLine() {
     fflush(stdout)
     continue
   }
-  // Third field: the icon-source mtime the caller observed before we drew anything.
-  let stamp = fields.count >= 3 ? Double(fields[2]) : nil
   let icon = NSWorkspace.shared.icon(forFile: appPath)
   icon.size = NSSize(width: s, height: s)
   guard let bmp = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: s, pixelsHigh: s, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
@@ -83,35 +81,13 @@ while let line = readLine() {
       .appendingPathComponent("${TEMP_PREFIX}" + UUID().uuidString)
     do {
       try data.write(to: tmpURL, options: .atomic)
-      // Stamp the temp file first so the entry is never even briefly visible carrying a
-      // wall-clock mtime; the post-finalization block below is what actually enforces it.
-      if let stamp = stamp, stamp > 0 {
-        try? fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: stamp)], ofItemAtPath: tmpURL.path)
-      }
+      // No timestamp is applied. The destination filename encodes the source state this
+      // bitmap was drawn from, so an entry's identity no longer depends on its mtime and
+      // there is nothing for a wall-clock write to misrepresent.
       if fm.fileExists(atPath: finalURL.path) {
         _ = try fm.replaceItemAt(finalURL, withItemAt: tmpURL)
       } else {
         try fm.moveItem(at: tmpURL, to: finalURL)
-      }
-      // Re-apply the stamp AFTER finalization and verify it took. \`moveItem\` preserves
-      // metadata within a volume, but \`replaceItemAt\` makes no broad cross-filesystem
-      // guarantee about the modification date — and if the stamp silently reverts to
-      // wall-clock time, an old bitmap drawn before an update reads as newer than the
-      // updated app and the stale icon is served forever. That is the exact race the
-      // stamp exists to prevent, so it must not depend on an unchecked \`try?\`.
-      if let stamp = stamp, stamp > 0 {
-        let target = Date(timeIntervalSince1970: stamp)
-        try fm.setAttributes([.modificationDate: target], ofItemAtPath: finalURL.path)
-        let applied = (try fm.attributesOfItem(atPath: finalURL.path)[.modificationDate] as? Date)
-        // Sub-millisecond slack: the stamp is serialized to 3 decimal places, so an exact
-        // equality check would fail on filesystems with finer resolution.
-        guard let applied = applied, abs(applied.timeIntervalSince1970 - stamp) < 0.002 else {
-          // Leave no entry rather than one whose mtime lies about what it depicts.
-          try? fm.removeItem(at: finalURL)
-          print("fail")
-          fflush(stdout)
-          continue
-        }
       }
       wrote = true
     } catch {
@@ -126,44 +102,19 @@ while let line = readLine() {
 `;
 
 /**
- * Cache filename for an app, keyed by a hash of the full bundle path.
+ * Stable per-app prefix, from a hash of the full bundle path.
  *
  * Hashing rather than sanitizing: replacing every non-alphanumeric character with
  * `_` collapses `A-B.app` and `A_B.app` onto one filename, so the two apps would
  * share a cache entry and one grid tile would show the other's icon. It also keeps
  * the name short, which sanitizing a deep path does not.
- */
-function cacheFileName(appPath: string): string {
-  const digest = createHash("sha256").update(appPath).digest("hex").slice(0, 32);
-  return `${digest}-${CACHE_ICON_SIZE}.png`;
-}
-
-export function cachedIconPath(appPath: string): string {
-  return path.join(CACHE_DIR, cacheFileName(appPath));
-}
-
-/**
- * Marker written beside a cache entry that was drawn while the app's icon sources were
- * unreadable.
  *
- * Timestamps alone can't express "drawn blind". An entry written *before* an outage and
- * one written *during* it are both newer than the app's last readable stamp, so no mtime
- * comparison can tell them apart — and that ambiguity is what forced a choice between
- * serving a pre-update icon forever and relaunching the extractor on every grid visit.
- * The marker records the fact directly.
- *
- * It holds the mtime of the PNG it vouches for, and is believed only while that still
- * matches the cache entry on disk. That binding is what makes the marker safe under
- * concurrency: an earlier design cleared markers in `findStaleApps` and re-wrote them
- * after extraction, leaving a check-then-act window where one refresh could recreate a
- * marker another had just retired — and a resurrected marker suppresses the single redraw
- * a later outage requires. Here a stale marker simply fails to match the current PNG and
- * is ignored, so there is no window to lose and nothing to clear.
+ * The prefix is what makes an entry attributable to an app without opening it, which
+ * `invalidateCachedIcon` and `pruneIconCache` both need — the rest of the filename
+ * encodes source state and is not derivable from the path alone.
  */
-const BLIND_SUFFIX = ".blind";
-
-function blindMarkerPath(appPath: string): string {
-  return path.join(CACHE_DIR, `${cacheFileName(appPath)}${BLIND_SUFFIX}`);
+function appPrefix(appPath: string): string {
+  return createHash("sha256").update(appPath).digest("hex").slice(0, 32);
 }
 
 /**
@@ -202,113 +153,98 @@ function iconStampPaths(appPath: string): string[] {
 }
 
 /**
- * What the icon-source timestamps say about an app.
+ * The observed state of one stamp path, rendered for hashing.
  *
- * `mtime` is the newest readable stamp. `unverifiable` records that a stamp existed but
- * couldn't be read, which is *not* the same as "unchanged" — see below.
+ * Three cases, kept distinct because collapsing any two of them was a real bug:
+ *
+ * - **Readable** contributes its mtime.
+ * - **Absent** (`ENOENT`/`ENOTDIR`) is the ordinary shape of an Asset Catalog app with no
+ *   `.icns`, so it must be a stable, benign value rather than evidence of change.
+ * - **Unreadable** (`EACCES`, I/O error) is *no information*. It gets its own token so a
+ *   blind observation can never produce the same key as a readable one — which is what
+ *   forces exactly one redraw on entering the blind state and another on recovery.
  */
-type IconSourceStamp = {
-  mtime: number;
-  unverifiable: boolean;
-};
-
-/**
- * The icon-source timestamps for an app: the newest readable mtime, plus whether any
- * stamp was unreadable.
- *
- * Three-way, because two of these are easy to conflate and each collapse is a real bug:
- *
- * - **Absent** (`ENOENT`/`ENOTDIR`) contributes nothing. That's the ordinary shape of an
- *   Asset Catalog app with no `Resources`, so it must not force re-extraction.
- * - **Unreadable** (`EACCES`, I/O error) is *no information at all*. Treating it as 0 lets
- *   an in-place update hide: if the only paths that moved are the unreadable ones, the
- *   stale-but-newer-than-the-root cache passes the freshness test and the grid serves the
- *   pre-update icon forever. Verified with the bundle root at mode 000 — `Contents`,
- *   `Info.plist` and `Resources` all `EACCES`, root mtime unchanged, cache judged FRESH.
- * - **Readable** decides normally.
- *
- * `unverifiable` is deliberately *not* folded into `mtime` as a sentinel. An earlier
- * revision returned `Infinity` for the unreadable case; that is unsatisfiable — no file's
- * mtime is >= Infinity — so entries stayed stale forever and every grid visit relaunched
- * the extractor for an icon already cached successfully. Callers get the fact and decide,
- * which is what lets extraction converge once access recovers.
- */
-async function iconSourceStamp(appPath: string): Promise<IconSourceStamp> {
-  const results = await Promise.all(
-    iconStampPaths(appPath).map(async (target) => {
-      try {
-        return { mtime: (await stat(target)).mtimeMs, unverifiable: false };
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        const absent = code === "ENOENT" || code === "ENOTDIR";
-        return { mtime: 0, unverifiable: !absent };
-      }
-    }),
-  );
-  return {
-    mtime: Math.max(...results.map((result) => result.mtime)),
-    unverifiable: results.some((result) => result.unverifiable),
-  };
+async function stampState(target: string): Promise<string> {
+  try {
+    return String((await stat(target)).mtimeMs);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unreadable";
+  }
 }
 
 /**
- * Apps whose cached icon is missing, older than the bundle's icon sources, or whose
- * sources couldn't be read — so this re-extracts exactly the icons that changed, plus the
- * ones we can't vouch for, and leaves the rest alone.
+ * The cache filename for an app *in its currently observed source state*.
  *
- * An unreadable source counts as stale, because the alternative is serving a pre-update
- * icon indefinitely — but only until one extraction has actually run against it.
+ * This is the whole freshness mechanism. The filename encodes what was observed, so
+ * "is the cache fresh?" collapses to "does this exact file exist?" — one `stat`, no
+ * timestamp comparison, no sidecar, and nothing whose order can be got wrong.
  *
- * The bound matters as much as the trigger. Returning stale on `unverifiable` alone
- * relaunches the Swift extractor on *every* grid visit for as long as the condition
- * lasts, and a bundle can be unreadable permanently (restrictive permissions, a mount
- * that never comes back). That is a ~1s process launch and a progress toast on every
- * open, for an icon already sitting correctly in the cache — measured: five visits, five
- * extractions, no convergence.
+ * Why this shape, after four fixes to the previous one: with a single fixed filename per
+ * app, freshness had to be *inferred* by reading several things (the entry's mtime, the
+ * source stamps, a `.blind` marker) and comparing them. Every one of those reads is a
+ * separate syscall, so every fix amounted to choosing a different linearization point, and
+ * each choice left a different window — an aborted extraction committing a marker, a
+ * concurrent refresh resurrecting one, an export deleting the entry mid-check. Encoding
+ * the evidence *in the name* removes the comparison entirely: a stale entry is not a file
+ * that fails a test, it is a file nobody asks for.
  *
- * A cache entry written *after* the newest readable evidence has already incorporated
- * whatever we last saw, so it is re-extracted once and then trusted while the condition
- * persists. Real change still gets through: any readable stamp that moves — including the
- * bundle root, which an installer or a mount cycle touches — pushes `source.mtime` past
- * the entry and marks it stale again.
+ * The full ordered vector is hashed, not a `max()`. A maximum discards which path moved,
+ * and an entry whose newest stamp vanishes can make the maximum go *backwards*.
+ *
+ * Two entries for the same app differ only after the `-`, so `appPrefix` still attributes
+ * any entry to its app without opening it.
  */
-async function findStaleApps(appPaths: readonly string[]): Promise<string[]> {
-  const stale = await Promise.all(
+async function cacheKey(appPath: string): Promise<string> {
+  const states = await Promise.all(iconStampPaths(appPath).map(stampState));
+  // The app path is already in the prefix; including it here too binds the state digest to
+  // this app, so two apps with coincidentally identical state vectors can't share a name.
+  const digest = createHash("sha256")
+    .update(`${CACHE_ICON_SIZE}\u0000${appPath}\u0000${states.join("\u0000")}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `${appPrefix(appPath)}-${digest}.png`;
+}
+
+/** Where an app's icon lives *right now*, given what its sources currently look like. */
+async function currentEntryPath(appPath: string): Promise<string> {
+  return path.join(CACHE_DIR, await cacheKey(appPath));
+}
+
+/**
+ * The apps whose icon must be (re)drawn, each paired with the file to write.
+ *
+ * A cache entry is named for the source state it was drawn from, so this is a single
+ * existence check per app — no timestamp comparison, no sidecar, no ordering. The three
+ * cases it has to get right all fall out of that:
+ *
+ * - **Changed sources** hash to a name nothing has written yet: a miss, so it is redrawn.
+ * - **Unchanged sources** hash to the name already on disk: a hit, so nothing happens.
+ * - **A deleted entry** (an export invalidating it) is a miss by definition, even if it
+ *   vanishes while this runs — there is no earlier observation left to contradict.
+ *
+ * The blind case is no longer special. An unreadable stamp hashes to its own token, so
+ * entering that state yields a name that has never been written (one redraw) and staying
+ * in it keeps yielding the same name (no further work). Recovery changes the token back,
+ * forcing exactly one redraw from the readable state — which the previous design could
+ * not guarantee, because a blind entry stamped at wall-clock time could outlive the
+ * outage looking fresh.
+ *
+ * The returned path is the SAME one the caller renders, so a resolved key is never
+ * recomputed against sources that may have moved in between.
+ */
+async function findStaleApps(appPaths: readonly string[]): Promise<{ appPath: string; entryPath: string }[]> {
+  const results = await Promise.all(
     appPaths.map(async (appPath) => {
-      const cached = cachedIconPath(appPath);
-      try {
-        // Gather the evidence first, then confirm the entry still exists.
-        //
-        // The ORDER is the point. Everything here is compared against a cache entry, so a
-        // timestamp captured before the other reads can outlive the file it describes: an
-        // export invalidating the icon mid-check would leave a stale mtime that still
-        // satisfies the comparison, judging a deleted PNG "fresh". The app is then skipped,
-        // `refreshIconCache` reports nothing extracted, and because the grid only
-        // re-derives `cachedApps` when something *was* extracted, the tile keeps pointing
-        // at a file that is gone. Stat'ing last means a deleted entry throws into the catch
-        // below — which is already the "not cached yet" path, so it re-extracts.
-        const [source, vouchedFor] = await Promise.all([
-          iconSourceStamp(appPath),
-          readFile(blindMarkerPath(appPath), "utf8").catch(() => null),
-        ]);
-        const cachedStat = await stat(cached);
-        if (source.unverifiable) {
-          // Blind: re-draw once, then trust it. The marker is believed only if it vouches
-          // for the PNG that is actually there — a marker naming a different mtime belongs
-          // to a superseded entry, so it can't suppress a redraw that is still owed.
-          return vouchedFor === String(cachedStat.mtimeMs) ? null : appPath;
-        }
-        // No marker cleanup here. A readable pass that rewrites the entry gives it a new
-        // mtime, which invalidates any marker by itself; one that changes nothing leaves a
-        // marker that is still accurate about what it describes. `pruneIconCache` collects
-        // markers for uninstalled apps.
-        return cachedStat.mtimeMs >= source.mtime ? null : appPath;
-      } catch {
-        return appPath; // not cached yet
-      }
+      const entryPath = await currentEntryPath(appPath);
+      const present = await stat(entryPath).then(
+        () => true,
+        () => false,
+      );
+      return present ? null : { appPath, entryPath };
     }),
   );
-  return stale.filter((appPath): appPath is string => appPath !== null);
+  return results.filter((entry): entry is { appPath: string; entryPath: string } => entry !== null);
 }
 
 /**
@@ -329,49 +265,13 @@ export async function refreshIconCache(
   if (stale.length === 0) return 0;
 
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
-  // Apps whose sources couldn't be read this pass. Collected here, marked only after the
-  // extractor confirms each one was actually redrawn.
-  const blind = new Set<string>();
-  // Each job carries the icon-source mtime observed BEFORE drawing, and the extractor
-  // stamps the file it writes with that value instead of "now".
-  //
-  // Without this, a bitmap drawn from the pre-update bundle can land after an export has
-  // invalidated the entry, and its wall-clock mtime would then be newer than the updated
-  // app's — marking demonstrably stale pixels fresh forever. Stamping with the observed
-  // time makes the file's mtime describe *what was drawn*, so if the app changed in the
-  // meantime the entry stays behind the app and is re-extracted on the next visit.
-  const jobs = (
-    await Promise.all(
-      stale.map(async (appPath) => {
-        const source = await iconSourceStamp(appPath);
-        // Seconds, as Swift's Date(timeIntervalSince1970:) takes. Rounded UP to the next
-        // millisecond: the freshness test is `cached >= source`, so a stamp that landed
-        // even a fraction of a millisecond below the source mtime would read as stale on
-        // every single grid visit and re-extract the whole fleet forever. Ceiling keeps a
-        // just-written entry at or above its source while staying far below the mtime any
-        // later app update would produce.
-        //
-        // Omit the stamp when the sources couldn't be fully read, or when there is no
-        // usable time at all. `source.mtime` then describes only the *readable* subset,
-        // which for an unverifiable app is precisely the pre-update root that hid the
-        // change in the first place — stamping with it would leave the entry looking older
-        // than it is and re-extract on every visit.
-        //
-        // Wall-clock is the correct mtime here, and it is what bounds the work: it records
-        // when these pixels were drawn, it is necessarily >= every readable stamp, so the
-        // freshness test in `findStaleApps` accepts the entry on the next visit instead of
-        // relaunching the extractor. The pixels are current regardless of the unreadable
-        // path, because `NSWorkspace` resolves an app's icon without needing to stat the
-        // bundle's interior.
-        const usable = !source.unverifiable && Number.isFinite(source.mtime) && source.mtime > 0;
-        const stamp = usable ? ` ${(Math.ceil(source.mtime) / 1000).toFixed(3)}` : "";
-        // Note which apps are being drawn blind, but do NOT mark them yet — the marker
-        // means "a redraw completed", and nothing has been drawn at this point.
-        if (source.unverifiable) blind.add(appPath);
-        return `${encode(appPath)} ${encode(cachedIconPath(appPath))}${stamp}`;
-      }),
-    )
-  ).join("\n");
+  // No mtime stamp accompanies a job any more. The previous design had to write each entry
+  // with the source time observed before drawing, so a bitmap drawn pre-update could not
+  // later masquerade as fresh — an entire mechanism (plus a Swift-side verification of it)
+  // that existed only because one filename had to serve every version of an app's icon.
+  // A state-addressed name carries that distinction itself: pixels drawn from an older
+  // state are written under the older name, which nothing subsequently asks for.
+  const jobs = stale.map(({ appPath, entryPath }) => `${encode(appPath)} ${encode(entryPath)}`).join("\n");
 
   onProgress?.(0, stale.length);
 
@@ -387,26 +287,20 @@ export async function refreshIconCache(
   // The extractor prints one line per icon. Counting them as they arrive is what makes
   // the toast a live counter rather than a spinner that lies about state. Only "done"
   // counts — a failed write must not inflate progress.
+  //
+  // Nothing is keyed off WHICH job a line belongs to any more. The previous design paired
+  // the Nth line with the Nth job to decide whose marker to write, which made a silently
+  // skipped line an attribution bug; that pairing is gone with the markers. The extractor
+  // still prints exactly one line per job, and the count is still honest, but a miscount
+  // could now at worst misreport progress rather than mislabel a cache entry.
   let done = 0;
   let pending = "";
-  // The extractor emits one line per job, in the order the jobs were written, so the
-  // Nth line belongs to `stale[N]`. Tracking that index is what lets a blind app be
-  // marked only once ITS redraw is confirmed.
-  let resultIndex = 0;
-  const redrawn: string[] = [];
   child.child.stdout?.on("data", (chunk: Buffer) => {
     // Chunks can split mid-line, so hold the remainder until its newline arrives.
     pending += chunk.toString();
     const lines = pending.split("\n");
     pending = lines.pop() ?? "";
-    for (const line of lines) {
-      if (line !== "done" && line !== "fail") continue;
-      const appPath = stale[resultIndex];
-      resultIndex += 1;
-      if (line !== "done") continue;
-      done += 1;
-      if (appPath !== undefined && blind.has(appPath)) redrawn.push(appPath);
-    }
+    done += lines.filter((line) => line === "done").length;
     onProgress?.(Math.min(done, stale.length), stale.length);
   });
 
@@ -414,29 +308,6 @@ export async function refreshIconCache(
     await child;
   } finally {
     signal?.removeEventListener("abort", abort);
-    // Mark blind apps only now, and only the ones the extractor confirmed with `done`.
-    //
-    // Writing the marker up front committed a redraw that hadn't happened: leaving the
-    // grid kills the extractor mid-batch, and an individual write can fail, either of
-    // which left the marker claiming "already redrawn" for an entry still holding the old
-    // pixels — so every later visit accepted a stale icon indefinitely. Reproduced before
-    // this change: abort the extractor once and the stale tile persists forever.
-    //
-    // In `finally` so an abort still records the icons that DID complete before the kill;
-    // dropping those would re-extract work that genuinely finished.
-    //
-    // The marker records the mtime of the PNG it vouches for, read back after the write
-    // landed. Binding it to the entry is what makes this safe to run concurrently: if
-    // another refresh replaces the PNG, its mtime moves and this marker stops being
-    // believed on its own — no clear step, and so no check-then-act window in which a
-    // retired marker could be resurrected.
-    await Promise.all(
-      redrawn.map(async (appPath) => {
-        const written = await stat(cachedIconPath(appPath)).catch(() => null);
-        if (!written) return;
-        await writeFile(blindMarkerPath(appPath), String(written.mtimeMs)).catch(() => {});
-      }),
-    );
   }
 
   // Report what actually succeeded. Claiming `stale.length` here would paper over a
@@ -446,58 +317,75 @@ export async function refreshIconCache(
 }
 
 /**
- * The apps that currently have a cached icon on disk. The grid uses this to choose
- * between the sharp cached PNG and the system `fileIcon`, so it reflects what was
- * really written rather than what we hoped would be.
+ * The cache entry to render for each app that has one, keyed by app path.
+ *
+ * A Map rather than a Set because the filename is no longer derivable from the app path —
+ * it encodes observed source state, so only a resolver that has *looked* can name it. The
+ * grid renders exactly what this returns, which is also what keeps the rendered path and
+ * the freshness decision from being computed at two different moments against sources that
+ * may have moved in between.
  */
-export async function listCachedApps(appPaths: readonly string[]): Promise<Set<string>> {
-  const cached = await Promise.all(
+export async function listCachedApps(appPaths: readonly string[]): Promise<ReadonlyMap<string, string>> {
+  const resolved = await Promise.all(
     appPaths.map(async (appPath) => {
-      try {
-        await stat(cachedIconPath(appPath));
-        return appPath;
-      } catch {
-        return null;
-      }
+      const entryPath = await currentEntryPath(appPath);
+      const present = await stat(entryPath).then(
+        () => true,
+        () => false,
+      );
+      return present ? ([appPath, entryPath] as const) : null;
     }),
   );
-  return new Set(cached.filter((appPath): appPath is string => appPath !== null));
+  return new Map(resolved.filter((entry): entry is readonly [string, string] => entry !== null));
 }
 
 /**
- * Drop one app's cached icon so the next grid visit re-extracts it.
+ * Drop every cached entry for one app so the next grid visit re-extracts it.
  *
  * Called after an export, which is the one moment we know the user has deliberately
- * touched this app — and exports read the live bundle, never the cache. Bundle-root
- * mtime doesn't always change when an app updates its icon in place, so this is the
- * cheap self-healing path for a stale tile: no per-launch version probing, and the
- * user can refresh a wrong icon by exporting it.
+ * touched this app — and exports read the live bundle, never the cache.
+ *
+ * Every entry for the app is removed, not just the one matching the current source state.
+ * The point of invalidating is to discard what we believe about this icon, and an entry
+ * written under some earlier state would otherwise be waiting to be re-adopted the moment
+ * the sources looked that way again. The `appPrefix` is what makes that sweep possible
+ * without opening anything.
  */
 export async function invalidateCachedIcon(appPath: string): Promise<void> {
-  await unlink(cachedIconPath(appPath)).catch(() => {});
-  // Drop the blind marker too, or an app cached during an outage would keep its
-  // "already re-drawn" pass and skip the re-extraction this invalidation exists to force.
-  await unlink(blindMarkerPath(appPath)).catch(() => {});
+  const prefix = `${appPrefix(appPath)}-`;
+  try {
+    const entries = await readdir(CACHE_DIR);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.startsWith(prefix))
+        .map((entry) => unlink(path.join(CACHE_DIR, entry)).catch(() => {})),
+    );
+  } catch {
+    // No cache directory yet — nothing to invalidate.
+  }
 }
 
 /**
- * Drop cache entries for apps that are no longer installed, so an uninstalled app
- * doesn't leave a PNG behind forever.
+ * Drop cache entries nothing will ask for again: uninstalled apps, and superseded states
+ * of installed ones.
+ *
+ * State-addressed names mint a new entry whenever an app's icon sources change, so without
+ * this the directory would grow by one file per app update. Keeping only the CURRENTLY
+ * resolved key per app collects both cases in a single pass — an uninstalled app has no
+ * current key at all, and a superseded entry simply isn't the current one.
+ *
+ * This is also why the previous `.blind` sidecar needed a special case here and this does
+ * not: there is one kind of file in the cache again.
  */
 export async function pruneIconCache(appPaths: readonly string[]): Promise<void> {
-  const live = new Set(appPaths.map((appPath) => cacheFileName(appPath)));
-  // A `<name>.blind` marker belongs to a live entry too. Without this it would be pruned
-  // on every grid visit — and a marker that never survives is a marker that never bounds
-  // anything, putting the blind case straight back into re-extracting forever.
-  const isLive = (entry: string) =>
-    live.has(entry) || (entry.endsWith(BLIND_SUFFIX) && live.has(entry.slice(0, -BLIND_SUFFIX.length)));
+  const live = new Set(await Promise.all(appPaths.map((appPath) => cacheKey(appPath))));
   try {
     const entries = await readdir(CACHE_DIR);
     await Promise.all(
       entries
         // Never touch a `.tmp-*` sibling: it belongs to an extraction that may still be
         // running in another window, and deleting it mid-write fails that icon.
-        .filter((entry) => !entry.startsWith(TEMP_PREFIX) && !isLive(entry))
+        .filter((entry) => !entry.startsWith(TEMP_PREFIX) && !live.has(entry))
         .map((entry) => unlink(path.join(CACHE_DIR, entry)).catch(() => {})),
     );
   } catch {
