@@ -148,19 +148,20 @@ function appPrefix(appPath: string): string {
  */
 async function iconStampPaths(appPath: string): Promise<string[]> {
   const resources = path.join(appPath, "Contents", "Resources");
-  const paths = [
-    appPath,
-    path.join(appPath, "Contents"),
-    path.join(appPath, "Contents", "Info.plist"),
-    resources,
-    path.join(resources, "AppIcon.icns"),
-    path.join(resources, "Assets.car"),
-  ];
   const declared = await declaredIconFile(appPath);
-  if (declared && declared !== "AppIcon.icns" && declared !== "Assets.car") {
-    paths.push(path.join(resources, declared));
-  }
-  return paths;
+  // A Set rather than a conditional push: when the declared name IS one of the
+  // conventional ones, listing it twice would hash its state twice for no gain.
+  return [
+    ...new Set([
+      appPath,
+      path.join(appPath, "Contents"),
+      path.join(appPath, "Contents", "Info.plist"),
+      resources,
+      path.join(resources, "AppIcon.icns"),
+      path.join(resources, "Assets.car"),
+      ...(declared ? [path.join(resources, declared)] : []),
+    ]),
+  ];
 }
 
 /**
@@ -241,6 +242,33 @@ async function currentEntryPath(appPath: string): Promise<string> {
   return path.join(CACHE_DIR, await cacheKey(appPath));
 }
 
+/** An app paired with the cache file for its current source state. */
+type ResolvedEntry = {
+  appPath: string;
+  entryPath: string;
+  /** Whether that file is already on disk — a hit needs no work, a miss must be drawn. */
+  cached: boolean;
+};
+
+/**
+ * Resolve every app to its current entry and note whether it exists.
+ *
+ * The one place that turns "what do these apps look like now?" into paths on disk. Both
+ * callers below are views of this: extraction wants the misses, the grid wants the hits.
+ */
+async function resolveEntries(appPaths: readonly string[]): Promise<ResolvedEntry[]> {
+  return Promise.all(
+    appPaths.map(async (appPath) => {
+      const entryPath = await currentEntryPath(appPath);
+      const cached = await stat(entryPath).then(
+        () => true,
+        () => false,
+      );
+      return { appPath, entryPath, cached };
+    }),
+  );
+}
+
 /**
  * The apps whose icon must be (re)drawn, each paired with the file to write.
  *
@@ -263,18 +291,8 @@ async function currentEntryPath(appPath: string): Promise<string> {
  * The returned path is the SAME one the caller renders, so a resolved key is never
  * recomputed against sources that may have moved in between.
  */
-async function findStaleApps(appPaths: readonly string[]): Promise<{ appPath: string; entryPath: string }[]> {
-  const results = await Promise.all(
-    appPaths.map(async (appPath) => {
-      const entryPath = await currentEntryPath(appPath);
-      const present = await stat(entryPath).then(
-        () => true,
-        () => false,
-      );
-      return present ? null : { appPath, entryPath };
-    }),
-  );
-  return results.filter((entry): entry is { appPath: string; entryPath: string } => entry !== null);
+async function findStaleApps(appPaths: readonly string[]): Promise<ResolvedEntry[]> {
+  return (await resolveEntries(appPaths)).filter((entry) => !entry.cached);
 }
 
 /**
@@ -356,17 +374,8 @@ export async function refreshIconCache(
  * may have moved in between.
  */
 export async function listCachedApps(appPaths: readonly string[]): Promise<ReadonlyMap<string, string>> {
-  const resolved = await Promise.all(
-    appPaths.map(async (appPath) => {
-      const entryPath = await currentEntryPath(appPath);
-      const present = await stat(entryPath).then(
-        () => true,
-        () => false,
-      );
-      return present ? ([appPath, entryPath] as const) : null;
-    }),
-  );
-  return new Map(resolved.filter((entry): entry is readonly [string, string] => entry !== null));
+  const resolved = await resolveEntries(appPaths);
+  return new Map(resolved.filter((entry) => entry.cached).map(({ appPath, entryPath }) => [appPath, entryPath]));
 }
 
 /**

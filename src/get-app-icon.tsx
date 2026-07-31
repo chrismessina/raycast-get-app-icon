@@ -741,18 +741,21 @@ export default function Command() {
             description="No installed applications were detected on this Mac."
           />
         )}
-        {apps?.map((app) => (
-          <Grid.Item
-            key={app.path}
-            // The cached 256px PNG renders sharp. `Image.Fallback` can't hold a
-            // FileIcon, so pick the source directly: apps not yet cached (or that
-            // the extractor couldn't handle) keep the soft-but-present system icon.
-            content={cachedApps.get(app.path) ? { source: cachedApps.get(app.path) as string } : { fileIcon: app.path }}
-            title={app.name}
-            keywords={app.bundleId ? [app.bundleId] : []}
-            actions={<AppActions app={app} {...actionProps} />}
-          />
-        ))}
+        {apps?.map((app) => {
+          // The cached 256px PNG renders sharp. `Image.Fallback` can't hold a FileIcon, so
+          // pick the source directly: apps not yet cached (or that the extractor couldn't
+          // handle) keep the soft-but-present system icon.
+          const cached = cachedApps.get(app.path);
+          return (
+            <Grid.Item
+              key={app.path}
+              content={cached ? { source: cached } : { fileIcon: app.path }}
+              title={app.name}
+              keywords={app.bundleId ? [app.bundleId] : []}
+              actions={<AppActions app={app} {...actionProps} />}
+            />
+          );
+        })}
       </Grid>
     );
   }
