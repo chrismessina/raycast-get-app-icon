@@ -155,16 +155,23 @@ async function iconStampPaths(appPath: string): Promise<string[]> {
 /**
  * The `CFBundleIconFile` value, normalised to a filename, or null when it can't be read.
  *
- * XML plists are matched textually; a binary plist yields null rather than a wrong answer,
- * because a bogus path would hash into the key and churn it. `.icns` is appended when the
- * declared value omits it, which is the documented shorthand.
+ * XML plists are matched textually; a binary plist yields null. Returning nothing is always
+ * safe — the conventional names and directory stamps still cover the app — whereas a WRONG
+ * name is not, because it hashes into the cache key. So anything the regex can't be trusted
+ * to have read correctly is rejected rather than guessed at: a value carrying an XML entity
+ * (the text match doesn't decode them), or a path separator in either direction.
+ *
+ * `.icns` is appended when the declared value omits it, which is the documented shorthand.
  */
 async function declaredIconFile(appPath: string): Promise<string | null> {
   try {
     const plist = await readFile(path.join(appPath, "Contents", "Info.plist"), "utf8");
-    const match = plist.match(/<key>CFBundleIconFile<\/key>\s*<string>([^<]+)<\/string>/);
+    // Strip comments first: a commented-out key would otherwise be read as live.
+    const match = plist
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .match(/<key>CFBundleIconFile<\/key>\s*<string>([^<]+)<\/string>/);
     const name = match?.[1]?.trim();
-    if (!name || name.includes("/")) return null;
+    if (!name || /[\\/]/.test(name) || name.includes("&")) return null;
     return name.endsWith(".icns") ? name : `${name}.icns`;
   } catch {
     return null;
