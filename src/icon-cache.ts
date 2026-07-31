@@ -30,9 +30,9 @@ const TEMP_PREFIX = ".tmp-";
  * nominal size, so a grid tile upscales 32pt to ~128pt and looks soft. Drawing the
  * icon into an explicitly-sized bitmap forces the high-resolution representation.
  *
- * Reads `appPath<TAB>outPath` lines from stdin so a whole fleet costs one process
- * launch — the per-icon work is ~20ms, but each `xcrun swift` launch is ~1s, which
- * is why this is batched rather than called per app.
+ * Reads one `appPath outPath` job per line from stdin, both base64, so a whole fleet
+ * costs one process launch — the per-icon work is ~20ms against ~1s per `xcrun swift`
+ * launch, which is why this is batched rather than called per app.
  */
 const EXTRACTOR_SWIFT = `
 import AppKit
@@ -40,10 +40,8 @@ let s = ${CACHE_ICON_SIZE}
 while let line = readLine() {
   // Each field is base64 so a path containing a tab or newline can't forge an extra
   // record. Anything that doesn't decode is skipped rather than guessed at.
-  // EXACTLY ONE line is printed per input line, on every path. The caller pairs the Nth
-  // result with the Nth job, so a silent skip would shift every later result by one and
-  // attribute an outcome to the wrong app. Verified: a job with an undecodable field used
-  // to print nothing, and 3 jobs produced 2 lines.
+  // EXACTLY ONE line is printed per input line, on every path, so the caller's progress
+  // count matches the jobs it sent.
   let fields = line.components(separatedBy: " ")
   guard fields.count >= 2,
         let inData = Data(base64Encoded: fields[0]),
@@ -120,31 +118,21 @@ function appPrefix(appPath: string): string {
 /**
  * The paths whose mtimes decide whether a cached icon is still current.
  *
- * The bundle root alone is not enough. An updater that rewrites files *inside* the
- * bundle leaves the root's mtime untouched, so an app that changed its icon in place
- * kept showing the old tile forever. Measured on a real in-place update: the root
- * stayed at 12:25:41 while `Contents/Info.plist` moved to 12:25:42.
+ * Every path here covers a change the others miss, so dropping one silently stops
+ * detecting a real kind of icon update:
  *
- * `Info.plist` is included because it names the icon file, and `Resources` because its
- * directory mtime moves when an icon is added, replaced, or removed. Missing entries
- * are ignored, so an Asset Catalog app with no `.icns` is handled by the same check.
+ * - The **bundle root** misses in-place updates entirely — an updater rewriting files
+ *   inside the bundle leaves the root's mtime untouched.
+ * - **`Contents`** and **`Resources`** move when an entry is added, replaced, or removed,
+ *   but not when an existing file's bytes are overwritten.
+ * - The **icon payloads** cover exactly that case. `AppIcon.icns` and `Assets.car` are the
+ *   conventional names; `CFBundleIconFile` may name anything, and roughly half of installed
+ *   apps do (Visual Studio Code's is `Code.icns`), so the declared name is sampled too.
+ * - **`Info.plist`** both names the icon and changes on most updates.
  *
- * The icon payloads themselves are sampled too, because a directory's mtime moves only
- * when an *entry* changes — rewriting an existing file's bytes leaves it untouched.
- * Verified: overwriting `AppIcon.icns` in place moved only that file's mtime, and none of
- * the four directory/plist stamps, so the change was invisible without this.
- *
- * The bundle's DECLARED icon file is sampled as well, not just the conventional names.
- * `CFBundleIconFile` may name anything, and an updater rewriting that file's bytes in
- * place moves neither the `Resources` directory mtime nor any other stamp — so the change
- * would be invisible. This is not exotic: of 327 apps installed here, **150** declare a
- * name other than `AppIcon.icns`, including Visual Studio Code (`Code.icns`), Chrome Beta
- * (`app.icns`) and Airtable (`icon.icns`).
- *
- * The name is read from `Info.plist` directly rather than by spawning `plutil`, which
- * would cost a process per app per grid visit. Binary plists aren't parsed — the declared
- * name is then simply not sampled, leaving the conventional ones plus the directory stamp,
- * which is the same coverage this had before.
+ * The declared name is read from `Info.plist` directly rather than by spawning `plutil`
+ * per app per grid visit. A binary plist yields nothing and falls back to the conventional
+ * names plus the directory stamps.
  */
 async function iconStampPaths(appPath: string): Promise<string[]> {
   const resources = path.join(appPath, "Contents", "Resources");
@@ -208,20 +196,11 @@ async function stampState(target: string): Promise<string> {
  * The cache filename for an app *in its currently observed source state*.
  *
  * This is the whole freshness mechanism. The filename encodes what was observed, so
- * "is the cache fresh?" collapses to "does this exact file exist?" — one `stat`, no
- * timestamp comparison, no sidecar, and nothing whose order can be got wrong.
+ * "is the cache fresh?" collapses to "does this exact file exist?" — one `stat`, and no
+ * comparison whose operands could be read at different moments.
  *
- * Why this shape, after four fixes to the previous one: with a single fixed filename per
- * app, freshness had to be *inferred* by reading several things (the entry's mtime, the
- * source stamps, a `.blind` marker) and comparing them. Every one of those reads is a
- * separate syscall, so every fix amounted to choosing a different linearization point, and
- * each choice left a different window — an aborted extraction committing a marker, a
- * concurrent refresh resurrecting one, an export deleting the entry mid-check. Encoding
- * the evidence *in the name* removes the comparison entirely: a stale entry is not a file
- * that fails a test, it is a file nobody asks for.
- *
- * The full ordered vector is hashed, not a `max()`. A maximum discards which path moved,
- * and an entry whose newest stamp vanishes can make the maximum go *backwards*.
+ * Hash the full ordered vector, not a `max()`: a maximum discards which path moved, and
+ * goes *backwards* when the newest stamp disappears.
  *
  * Two entries for the same app differ only after the `-`, so `appPrefix` still attributes
  * any entry to its app without opening it.
@@ -272,24 +251,13 @@ async function resolveEntries(appPaths: readonly string[]): Promise<ResolvedEntr
 /**
  * The apps whose icon must be (re)drawn, each paired with the file to write.
  *
- * A cache entry is named for the source state it was drawn from, so this is a single
- * existence check per app — no timestamp comparison, no sidecar, no ordering. The three
- * cases it has to get right all fall out of that:
+ * An entry is named for the source state it was drawn from, so changed sources hash to a
+ * name nothing has written (a miss), unchanged sources hash to the one already there, and
+ * a deleted entry is a miss by definition.
  *
- * - **Changed sources** hash to a name nothing has written yet: a miss, so it is redrawn.
- * - **Unchanged sources** hash to the name already on disk: a hit, so nothing happens.
- * - **A deleted entry** (an export invalidating it) is a miss by definition, even if it
- *   vanishes while this runs — there is no earlier observation left to contradict.
- *
- * The blind case is no longer special. An unreadable stamp hashes to its own token, so
- * entering that state yields a name that has never been written (one redraw) and staying
- * in it keeps yielding the same name (no further work). Recovery changes the token back,
- * forcing exactly one redraw from the readable state — which the previous design could
- * not guarantee, because a blind entry stamped at wall-clock time could outlive the
- * outage looking fresh.
- *
- * The returned path is the SAME one the caller renders, so a resolved key is never
- * recomputed against sources that may have moved in between.
+ * An unreadable source needs no special case: it hashes to its own token, so entering that
+ * state redraws once, staying in it redraws nothing, and recovery redraws once more from
+ * the readable state.
  */
 async function findStaleApps(appPaths: readonly string[]): Promise<ResolvedEntry[]> {
   return (await resolveEntries(appPaths)).filter((entry) => !entry.cached);
@@ -313,12 +281,9 @@ export async function refreshIconCache(
   if (stale.length === 0) return 0;
 
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
-  // No mtime stamp accompanies a job any more. The previous design had to write each entry
-  // with the source time observed before drawing, so a bitmap drawn pre-update could not
-  // later masquerade as fresh — an entire mechanism (plus a Swift-side verification of it)
-  // that existed only because one filename had to serve every version of an app's icon.
-  // A state-addressed name carries that distinction itself: pixels drawn from an older
-  // state are written under the older name, which nothing subsequently asks for.
+  // Two fields: the app to draw, and exactly where to write it. Pixels drawn from an older
+  // state land under that state's name, which nothing subsequently asks for, so the job
+  // needs to carry no freshness information of its own.
   const jobs = stale.map(({ appPath, entryPath }) => `${encode(appPath)} ${encode(entryPath)}`).join("\n");
 
   onProgress?.(0, stale.length);
@@ -336,11 +301,8 @@ export async function refreshIconCache(
   // the toast a live counter rather than a spinner that lies about state. Only "done"
   // counts — a failed write must not inflate progress.
   //
-  // Nothing is keyed off WHICH job a line belongs to any more. The previous design paired
-  // the Nth line with the Nth job to decide whose marker to write, which made a silently
-  // skipped line an attribution bug; that pairing is gone with the markers. The extractor
-  // still prints exactly one line per job, and the count is still honest, but a miscount
-  // could now at worst misreport progress rather than mislabel a cache entry.
+  // Only the count is used, not which job a line belongs to — a miscount would misreport
+  // progress, never mislabel an entry.
   let done = 0;
   let pending = "";
   child.child.stdout?.on("data", (chunk: Buffer) => {
@@ -413,8 +375,6 @@ export async function invalidateCachedIcon(appPath: string): Promise<void> {
  * resolved key per app collects both cases in a single pass — an uninstalled app has no
  * current key at all, and a superseded entry simply isn't the current one.
  *
- * This is also why the previous `.blind` sidecar needed a special case here and this does
- * not: there is one kind of file in the cache again.
  */
 export async function pruneIconCache(appPaths: readonly string[], inUse: Iterable<string> = []): Promise<void> {
   const live = new Set(await Promise.all(appPaths.map((appPath) => cacheKey(appPath))));
@@ -422,9 +382,8 @@ export async function pruneIconCache(appPaths: readonly string[], inUse: Iterabl
   // the live key. State-addressed names made this necessary: a grid resolves a name, then
   // renders it for as long as the view is open, and if the app's sources move in between,
   // that name stops being "live" while still being on screen — so pruning purely by
-  // liveness would delete a file out from under a visible tile. (v1 could not hit this;
-  // its name was a pure function of the app path.) The entry is collected on a later pass
-  // once nothing is rendering it.
+  // liveness would delete a file out from under a visible tile. The entry is collected on
+  // a later pass once nothing is rendering it.
   for (const entryPath of inUse) live.add(path.basename(entryPath));
   try {
     const entries = await readdir(CACHE_DIR);
