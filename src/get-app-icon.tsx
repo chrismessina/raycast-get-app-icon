@@ -672,7 +672,7 @@ export default function Command() {
         if (cancelled) return;
         setCachedApps(warm);
 
-        const extracted = await refreshIconCache(
+        await refreshIconCache(
           appPaths,
           (done, total) => {
             if (cancelled || total === 0) return;
@@ -688,12 +688,18 @@ export default function Command() {
         );
         if (cancelled) return;
 
-        if (extracted > 0) {
-          const refreshed = await listCachedApps(appPaths);
-          if (cancelled) return;
-          setCachedApps(refreshed);
-        }
-        await pruneIconCache(appPaths);
+        // Re-resolve unconditionally, not only when something was extracted. A cache
+        // entry's name encodes the source state it was drawn from, so paths resolved
+        // before extraction can be superseded by an app updating meanwhile — even when
+        // this pass wrote nothing. Rendering a superseded name would show a tile whose
+        // file prune is entitled to collect.
+        const refreshed = await listCachedApps(appPaths);
+        if (cancelled) return;
+        setCachedApps(refreshed);
+        // Hand prune what is actually on screen. Without this it deletes entries that are
+        // no longer the live key but are still being rendered, blanking those tiles until
+        // the next refresh.
+        await pruneIconCache(appPaths, refreshed.values());
       } catch (error) {
         // An aborted extraction is a view change, not a failure worth a toast.
         if (!cancelled) {

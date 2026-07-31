@@ -377,8 +377,16 @@ export async function invalidateCachedIcon(appPath: string): Promise<void> {
  * This is also why the previous `.blind` sidecar needed a special case here and this does
  * not: there is one kind of file in the cache again.
  */
-export async function pruneIconCache(appPaths: readonly string[]): Promise<void> {
+export async function pruneIconCache(appPaths: readonly string[], inUse: Iterable<string> = []): Promise<void> {
   const live = new Set(await Promise.all(appPaths.map((appPath) => cacheKey(appPath))));
+  // Entries the caller is currently displaying are spared even when they no longer match
+  // the live key. State-addressed names made this necessary: a grid resolves a name, then
+  // renders it for as long as the view is open, and if the app's sources move in between,
+  // that name stops being "live" while still being on screen — so pruning purely by
+  // liveness would delete a file out from under a visible tile. (v1 could not hit this;
+  // its name was a pure function of the app path.) The entry is collected on a later pass
+  // once nothing is rendering it.
+  for (const entryPath of inUse) live.add(path.basename(entryPath));
   try {
     const entries = await readdir(CACHE_DIR);
     await Promise.all(
