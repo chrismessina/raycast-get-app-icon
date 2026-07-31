@@ -76,8 +76,15 @@ jobs:
                 curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$download_url" -o "$local_path/$name"
                 # Record what we wrote so the commit step can stage exactly these
                 # paths. Staging the whole tree would sweep in local-only work.
-                printf '%s\n' "${local_path#./}/$name" | sed 's|^/||' >> "$RUNNER_TEMP/synced-files.txt"
-                echo "  downloaded: $subpath/$name"
+                #
+                # `subpath` is ALREADY the full repo-relative path of this file — the API
+                # `path` with the `extensions/<ext>/` prefix stripped. Appending `$name` to
+                # it doubles the last component ("package.json/package.json"), and a manifest
+                # of paths that match nothing tracked makes the deletion loop below treat
+                # EVERY tracked file as "no longer served upstream". That wiped this mirror
+                # down to four directories on 2026-07-31, including this workflow.
+                printf '%s\n' "$subpath" >> "$RUNNER_TEMP/synced-files.txt"
+                echo "  downloaded: $subpath"
               elif [ "$type" = "dir" ]; then
                 mkdir -p "$local_path/$name"
                 download_dir "$api_path/$name" "$local_path/$name"
@@ -112,14 +119,35 @@ jobs:
           # Note the process substitution: piping `git ls-files` into the loop would
           # run it in a subshell, where `git rm` still works but the intent is easy
           # to break later. Reading from `< <(...)` keeps it in the current shell.
-          SYNCED_ROOTS=$(cut -d/ -f1 "$MANIFEST" | sort -u)
+          # Never consider paths this sync does not own, whatever the manifest says.
+          # `.github/` in particular holds THIS workflow: a manifest bug once made the
+          # loop delete it along with package.json and the README.
+          SYNCED_ROOTS=$(cut -d/ -f1 "$MANIFEST" | sort -u | grep -v '^\.github$')
+          CANDIDATES=$(git ls-files -- $SYNCED_ROOTS | grep -v '^\.github/' || true)
+
+          # Refuse to mass-delete. A partial download — a rate limit mid-recursion, a
+          # malformed manifest — looks exactly like "upstream removed everything", and
+          # the deletion loop cannot tell the difference. Bail instead of guessing.
+          TOTAL=$(printf '%s\n' "$CANDIDATES" | grep -c . || true)
+          DOOMED=0
           while read -r tracked; do
+            [ -n "$tracked" ] || continue
+            grep -Fxq "$tracked" "$MANIFEST" || DOOMED=$((DOOMED + 1))
+          done <<< "$CANDIDATES"
+          if [ "$TOTAL" -gt 0 ] && [ "$DOOMED" -gt $((TOTAL / 2)) ]; then
+            echo "ABORT: sync would delete $DOOMED of $TOTAL tracked files."
+            echo "That is a failed or partial download, not an upstream removal."
+            exit 1
+          fi
+
+          while read -r tracked; do
+            [ -n "$tracked" ] || continue
             if ! grep -Fxq "$tracked" "$MANIFEST"; then
               echo "  upstream no longer serves: $tracked"
               git rm -q --cached --ignore-unmatch -- "$tracked"
               rm -f -- "$tracked"
             fi
-          done < <(git ls-files -- $SYNCED_ROOTS)
+          done <<< "$CANDIDATES"
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
