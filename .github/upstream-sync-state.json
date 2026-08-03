@@ -1,0 +1,21 @@
+{
+  "upstream_commit": "5d65ed382d362de117fadd4e1f1202626071d64c",
+  "synced_at": "2026-08-03T05:13:54Z",
+  "files": {
+    ".prettierrc": "47d7ec67ad80dfdab257c25ad46b52af3fa8430a",
+    "assets/get-app-icon.png": "160b45771c8a756017451f184e0ebde73734ab75",
+    "CHANGELOG.md": "381ec7836f992f175824c5fb61bc532de0729711",
+    "eslint.config.mjs": "abdfe941ec46bb7d694a3929677a5b9bfe81c4b9",
+    "media/get-app-icon-grid.png": "b67bd0adce34fff7efe5d57dac92a1a9bb6a24e6",
+    "media/get-app-icon-list.png": "73dc6e00d412c6d41d47933b54e9c3d668660485",
+    "metadata/get-app-icon-1.png": "73dc6e00d412c6d41d47933b54e9c3d668660485",
+    "metadata/get-app-icon-2.png": "b67bd0adce34fff7efe5d57dac92a1a9bb6a24e6",
+    "metadata/get-app-icon-3.png": "38d1cbaea3fc993f2b8291c51adfbef895164234",
+    "package-lock.json": "f00bb2823ae64f376a5ead5844fba5ab6a55a3d0",
+    "package.json": "f24354d53903b207d1b09f91b3b1ab2ae4aafbbc",
+    "README.md": "5f170989add55356e775da0ad078d89f46515c89",
+    "src/get-app-icon.tsx": "49192efb62c71e06a74ddc281aad62cf3f1ed501",
+    "src/icon-cache.ts": "a7680edc9f9c78f3f58fb4827c43271f76c1dc4a",
+    "tsconfig.json": "b053169f65b8c345a08d7c6e8ef3ec9f36b96077"
+  }
+}
