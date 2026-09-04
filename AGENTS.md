@@ -14,22 +14,22 @@ alternative shipped and was wrong. A comment saying "kept distinct because colla
 two of them was a real bug" is a receipt, not a style note — read the block before changing
 the code under it, and `git log -p` the file when a comment's reasoning is not obvious.
 
-Fleet-wide conventions (Copy Error toasts, `Keyboard.Shortcut.Common`, no `any`, no
-hand-written `Preferences` types) live in
+Fleet-wide conventions live in
 `/Users/messina/Developer/GitHub/chrismessina/raycast-extension-workflows/plugins/raycast-extensions/reference/house-style.md`
 and are not restated here.
 
 ## The trap: reintroducing a comparison into cache freshness
 
-More than half of this repo's non-CI commits are one bug. Freshness of a cached grid icon
+A large cluster of this repo's commits addresses cache freshness and its concurrency
+consequences. Freshness of a cached grid icon
 used to be *inferred* — stat the cache entry, stat six source paths, read a `.blind`
 sidecar, compare them. A run of fix-to-fix commits each moved the failure somewhere else
 rather than fixing it (`e3cf7d3` → `ba135ef` → `4bbeaf1` → `67305d9` → `70a917b` →
 `9adf786`): an aborted extraction committing a marker, a concurrent refresh resurrecting
-one, an export deleting the entry mid-check. `b36a20a` names the pattern — "four
-consecutive fixes each amounted to choosing a different linearization point. The failures
-migrated instead of converging, which is the signature of a wrong shape rather than a wrong
-line." Every read is a separate syscall, so correctness depended on their order.
+one, an export deleting the entry mid-check. `b36a20a` names the pattern: each of those
+fixes only chose a different linearization point, and the failures migrated instead of
+converging — the signature, in its words, of a wrong shape rather than a wrong line. Every
+read is a separate syscall, so correctness depended on their order.
 
 `b36a20a` deleted the whole mechanism. **An entry is now named for the source state it was
 drawn from:**
@@ -96,8 +96,9 @@ another window.
 
 ## Things that look redundant and are not
 
-- **Two Swift extractors, on purpose.** `EXTRACTOR_SWIFT` (`src/icon-cache.ts:46`) is a batch
-  daemon: one `xcrun swift` launch (~1s, versus ~20ms of actual work per icon) reads
+- **Two Swift extractors, on purpose.** `EXTRACTOR_SWIFT` (`src/icon-cache.ts:46`) is a batched
+  one-shot extractor: one `xcrun swift` launch per refresh, awaited to exit (~1s of launch,
+  versus ~20ms of actual work per icon), reads
   `appPath outPath` job pairs from stdin, both base64 so no path can forge a record separator,
   and prints **exactly one line per input line on every path** — the caller counts `done` lines
   to drive the progress toast, so a silent skip desyncs it. `extractAppIconToFile`
@@ -135,14 +136,20 @@ another window.
 
 - `platforms` is `["macOS"]` only, so shortcuts here need no Windows counterpart. Everything
   shells out to `/usr/bin/sips`, `/usr/bin/plutil`, `/usr/bin/xcrun`, and `NSWorkspace`.
-- Three `eslint-disable` lines are deliberate, not debt. ⌘E on **Export Icons**
-  (`src/get-app-icon.tsx:447`) suppresses `prefer-common-shortcut` because the only matching
-  constant is `Common.Edit` and exporting is not editing — an honest custom chord beats a wrong
-  semantic match. The two `prefer-title-case` suppressions cover `512 x 512` submenu titles and
-  `Export Icons As…`.
-- Any long operation shows its indicator **before** the work starts and retires it in `finally`
-  (`src/get-app-icon.tsx:688`). A silent multi-second pause on first run reads as a stall; a
-  toast left on screen after the work stops is the UI lying about its state.
+- Five `eslint-disable` lines in `src/get-app-icon.tsx` are deliberate, not debt (grep for them
+  rather than trusting line numbers). ⌘E on **Export Icons** suppresses
+  `prefer-common-shortcut` because the only matching constant is `Common.Edit` and exporting is
+  not editing — an honest custom chord beats a wrong semantic match. Three `prefer-title-case`
+  suppressions cover the `512 x 512` titles in both the export and copy size submenus, and
+  `Export Icons As…`. One `no-control-regex` covers the control-character strip in
+  `sanitizeFolderName`, where the characters are legal in an Info.plist string but unusable in
+  a path.
+- The grid's progress toast is created immediately before the Swift batch begins and hidden in
+  `finally` (`src/get-app-icon.tsx:716`) — cache preflight (`mkdir`, key resolution, the
+  stale-entry `stat`s) happens first, and a warm cache never shows a toast at all because
+  `refreshIconCache` returns before the first progress callback. A silent multi-second pause on
+  first run reads as a stall; a toast left on screen after the work stops is the UI lying about
+  its state.
 - Grid extraction soft-fails: the tiles stay on system icons and `showError` says so. It is not
   worth a hard failure, but it is not worth silence either.
 
