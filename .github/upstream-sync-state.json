@@ -1,6 +1,6 @@
 {
-  "upstream_commit": "c33bf4cb4b9ad70c2b93432ee713ffb7486ed331",
-  "synced_at": "2026-10-09T16:23:48Z",
+  "upstream_commit": "dccfc8877dd0e658295cb4b6d29b4a0a1b79baf8",
+  "synced_at": "2026-11-17T18:41:02Z",
   "files": {
     ".prettierrc": "47d7ec67ad80dfdab257c25ad46b52af3fa8430a",
     "CHANGELOG.md": "381ec7836f992f175824c5fb61bc532de0729711",
@@ -13,7 +13,7 @@
     "metadata/get-app-icon-2.png": "b67bd0adce34fff7efe5d57dac92a1a9bb6a24e6",
     "metadata/get-app-icon-3.png": "38d1cbaea3fc993f2b8291c51adfbef895164234",
     "package-lock.json": "07c0acbc1326689700f6dbc387e2343d25c9788d",
-    "package.json": "f24354d53903b207d1b09f91b3b1ab2ae4aafbbc",
+    "package.json": "fe2d3feff406f71928113c98020fc132c597ffe4",
     "src/get-app-icon.tsx": "49192efb62c71e06a74ddc281aad62cf3f1ed501",
     "src/icon-cache.ts": "a7680edc9f9c78f3f58fb4827c43271f76c1dc4a",
     "tsconfig.json": "b053169f65b8c345a08d7c6e8ef3ec9f36b96077"
